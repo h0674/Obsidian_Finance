@@ -82,6 +82,8 @@ export const apiClient = createApi({
   reducerPath: "api",
   baseQuery: baseQueryWithReauth,
   refetchOnMountOrArgChange: true,
+  refetchOnFocus: true,
+  refetchOnReconnect: true,
   tagTypes: [
     "transactions",
     "analytics",
@@ -91,6 +93,10 @@ export const apiClient = createApi({
     "user",
     "telegram",
     "apiKey",
+    "accounts",
+    "goals",
+    "splits",
+    "subscriptions",
   ],
   endpoints: () => ({}),
 });

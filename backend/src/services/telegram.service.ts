@@ -32,6 +32,16 @@ import {
   checkDuplicateSmsTransaction,
 } from "./sms-parser.service";
 import { escapeHtml, isSafeHttpUrl } from "../utils/security";
+import {
+  getAllAccountsService,
+  resolveAccountForSmsService,
+} from "./account.service";
+import { getAllSplitsService } from "./split.service";
+import {
+  formatWeeklyDigestHtml,
+  generateWeeklyDigestService,
+  getSubscriptionRadarService,
+} from "./radar-digest.service";
 
 let bot: Telegraf | null = null;
 let botUsername: string = "";
@@ -171,6 +181,8 @@ export const initTelegramBot = async () => {
               `• <b>Voice Logging:</b> Hold the mic and speak any expense or question 🎙️\n` +
               `• <b>Anti-Regret Simulator:</b> /afford &lt;amount&gt; &lt;item&gt; <i>(e.g. /afford 45000 iPhone)</i>\n` +
               `• <b>Freedom Clock:</b> /freedom <i>(check your exact time-to-independence)</i>\n` +
+              `• <b>Accounts &amp; Splits:</b> /accounts or /splits\n` +
+              `• <b>Recurring Bills &amp; Digest:</b> /subscriptions or /digest\n` +
               `• <b>Live Stats:</b> /balance or /stats\n\n` +
               `Your Obsidian web dashboard will synchronize in real time! ⚡`,
             { parse_mode: "HTML" }
@@ -363,6 +375,131 @@ export const initTelegramBot = async () => {
         return ctx.reply(msg, { parse_mode: "HTML" });
       } catch (err: any) {
         return ctx.reply(`Error fetching runway: ${err.message}`);
+      }
+    });
+
+    // --- /subscriptions Command (Subscription & EMI Radar) ---
+    bot.command(["subscriptions", "emis", "radar"], async (ctx) => {
+      const chatId = ctx.chat.id.toString();
+      const user = await UserModel.findOne({ telegramChatId: chatId });
+      if (!user) {
+        return ctx.reply("Please link your account first using /start with your code from Settings.");
+      }
+
+      try {
+        await ctx.sendChatAction("typing");
+        const radar = await getSubscriptionRadarService(user._id.toString());
+        if (radar.subscriptions.length === 0) {
+          return ctx.reply("📡 No recurring subscriptions or EMIs detected yet.");
+        }
+
+        const currency = user.currency || "INR";
+        const fmt = (val: number) =>
+          new Intl.NumberFormat(currency === "INR" ? "en-IN" : "en-US", {
+            style: "currency",
+            currency,
+            maximumFractionDigits: 0,
+          }).format(val);
+
+        let msg =
+          `📡 <b>Recurring Bills &amp; Subscriptions</b>\n` +
+          `Est. Monthly Total: <b>${escapeHtml(fmt(radar.summary.totalMonthlyRecurring))}</b>\n\n`;
+
+        for (const sub of radar.subscriptions.slice(0, 8)) {
+          const dueLabel =
+            sub.daysUntilDue === 0
+              ? "Due Today"
+              : sub.daysUntilDue === 1
+                ? "Due Tomorrow"
+                : `In ${sub.daysUntilDue}d`;
+          msg += `• <b>${escapeHtml(sub.title)}</b>: ${escapeHtml(fmt(sub.amount))} (${escapeHtml(sub.interval)} • ${dueLabel})\n`;
+        }
+
+        return ctx.reply(msg, { parse_mode: "HTML" });
+      } catch (err: any) {
+        return ctx.reply(`Error fetching subscriptions: ${err.message}`);
+      }
+    });
+
+    // --- /digest Command (Weekly Wealth Digest) ---
+    bot.command(["digest", "weekly"], async (ctx) => {
+      const chatId = ctx.chat.id.toString();
+      const user = await UserModel.findOne({ telegramChatId: chatId });
+      if (!user) {
+        return ctx.reply("Please link your account first using /start with your code from Settings.");
+      }
+
+      try {
+        await ctx.sendChatAction("typing");
+        const digest = await generateWeeklyDigestService(user._id.toString());
+        return ctx.reply(formatWeeklyDigestHtml(digest), { parse_mode: "HTML" });
+      } catch (err: any) {
+        return ctx.reply(`Error generating weekly digest: ${err.message}`);
+      }
+    });
+
+    // --- /accounts Command (Wallets Overview) ---
+    bot.command(["accounts", "wallets"], async (ctx) => {
+      const chatId = ctx.chat.id.toString();
+      const user = await UserModel.findOne({ telegramChatId: chatId });
+      if (!user) {
+        return ctx.reply("Please link your account first using /start with your code from Settings.");
+      }
+
+      try {
+        const data = await getAllAccountsService(user._id.toString());
+        if (data.accounts.length === 0) {
+          return ctx.reply("🏦 No accounts configured yet. Add them in your Obsidian Wallets tab.");
+        }
+        const currency = user.currency || "INR";
+        const fmt = (val: number) =>
+          new Intl.NumberFormat(currency === "INR" ? "en-IN" : "en-US", {
+            style: "currency",
+            currency,
+            maximumFractionDigits: 0,
+          }).format(val);
+
+        let msg =
+          `🏦 <b>Accounts &amp; Wallets</b>\n` +
+          `Net Balance: <b>${escapeHtml(fmt(data.summary.netBalance))}</b>\n\n`;
+        for (const acc of data.accounts) {
+          const mask = acc.accountMask ? ` (••${escapeHtml(acc.accountMask)})` : "";
+          msg += `• <b>${escapeHtml(acc.name)}</b>${mask}: ${escapeHtml(fmt(Number(acc.balance) || 0))}\n`;
+        }
+        return ctx.reply(msg, { parse_mode: "HTML" });
+      } catch (err: any) {
+        return ctx.reply(`Error fetching accounts: ${err.message}`);
+      }
+    });
+
+    // --- /splits Command (Pending IOUs) ---
+    bot.command(["splits", "ious"], async (ctx) => {
+      const chatId = ctx.chat.id.toString();
+      const user = await UserModel.findOne({ telegramChatId: chatId });
+      if (!user) {
+        return ctx.reply("Please link your account first using /start with your code from Settings.");
+      }
+
+      try {
+        const data = await getAllSplitsService(user._id.toString());
+        const currency = user.currency || "INR";
+        const fmt = (val: number) =>
+          new Intl.NumberFormat(currency === "INR" ? "en-IN" : "en-US", {
+            style: "currency",
+            currency,
+            maximumFractionDigits: 0,
+          }).format(val);
+
+        const msg =
+          `🤝 <b>Splits &amp; IOUs</b>\n\n` +
+          `📈 <b>Owed To You:</b> ${escapeHtml(fmt(data.summary.totalOwedToMe))}\n` +
+          `📉 <b>You Owe:</b> ${escapeHtml(fmt(data.summary.totalIOwe))}\n` +
+          `⚖️ <b>Net Position:</b> ${escapeHtml(fmt(data.summary.netReceivable))}\n` +
+          `⏳ <b>Open Items:</b> ${data.summary.pendingCount}`;
+
+        return ctx.reply(msg, { parse_mode: "HTML" });
+      } catch (err: any) {
+        return ctx.reply(`Error fetching splits: ${err.message}`);
       }
     });
 
@@ -952,6 +1089,11 @@ If the message is an analytical or advisory question (e.g., "what's my balance?"
             );
           }
 
+          const matchedAccount = await resolveAccountForSmsService(
+            user._id.toString(),
+            deterministicSms.accountMask
+          );
+
           const created = await createTransactionService(
             {
               title: deterministicSms.title,
@@ -962,6 +1104,7 @@ If the message is an analytical or advisory question (e.g., "what's my balance?"
               date: deterministicSms.date || new Date(),
               description: `Bank SMS: ${deterministicSms.title}`,
               externalRef: deterministicSms.externalRef || null,
+              accountId: matchedAccount?._id?.toString() || null,
               isRecurring: false,
             },
             user._id.toString()

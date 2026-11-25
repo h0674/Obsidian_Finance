@@ -28,6 +28,14 @@ const Navbar = () => {
       label: "Transactions",
     },
     {
+      href: PROTECTED_ROUTES.ACCOUNTS,
+      label: "Accounts",
+    },
+    {
+      href: PROTECTED_ROUTES.PLANNING,
+      label: "Planning",
+    },
+    {
       href: PROTECTED_ROUTES.REPORTS,
       label: "Reports",
     },

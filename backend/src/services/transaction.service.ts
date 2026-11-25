@@ -31,12 +31,62 @@ import { uploadBufferToCloudinary } from "../config/cloudinary.config";
 import { assertValidReceiptFile } from "../utils/file-validation";
 import { withUserLedgerLock } from "../utils/ledger-lock";
 import { escapeHtml, escapeRegex, sanitizeCsvCell } from "../utils/security";
+import AccountModel from "../models/account.model";
+import {
+  applyAccountBalanceDelta,
+  resolveAccountForSmsService,
+} from "./account.service";
+import { checkAndNotifyBudgetThresholds } from "./budget.service";
+
+const assertOwnedAccounts = async (
+  userId: string,
+  accountId?: string | null,
+  toAccountId?: string | null,
+  type?: string
+) => {
+  if (type === TransactionTypeEnum.TRANSFER) {
+    if (!accountId || !toAccountId) {
+      throw new BadRequestException(
+        "Transfer requires both source and destination accounts"
+      );
+    }
+    if (String(accountId) === String(toAccountId)) {
+      throw new BadRequestException(
+        "Source and destination accounts must be different"
+      );
+    }
+  }
+  if (accountId) {
+    const exists = await AccountModel.exists({ _id: accountId, userId });
+    if (!exists) throw new NotFoundException("Source account not found");
+  }
+  if (toAccountId) {
+    const exists = await AccountModel.exists({ _id: toAccountId, userId });
+    if (!exists) throw new NotFoundException("Destination account not found");
+  }
+};
 
 export const createTransactionService = async (
   body: CreateTransactionType,
   userId: string
 ) => {
   return withUserLedgerLock(userId, async () => {
+    let resolvedAccountId = body.accountId;
+    if (
+      resolvedAccountId === undefined &&
+      body.type !== TransactionTypeEnum.TRANSFER
+    ) {
+      const defaultAcc = await resolveAccountForSmsService(userId);
+      resolvedAccountId = defaultAcc?._id?.toString() || null;
+    }
+
+    await assertOwnedAccounts(
+      userId,
+      resolvedAccountId,
+      body.toAccountId,
+      body.type
+    );
+
     let nextRecurringDate: Date | null = null;
     const currentDate = new Date();
 
@@ -62,6 +112,7 @@ export const createTransactionService = async (
 
     const transaction = await TransactionModel.create({
       ...body,
+      accountId: resolvedAccountId ?? null,
       userId,
       category: body.category,
       amount: Number(body.amount),
@@ -84,6 +135,17 @@ export const createTransactionService = async (
     transaction.ledgerHash = blockHash;
     await transaction.save();
 
+    await applyAccountBalanceDelta(userId, {
+      type: transaction.type,
+      amount: Number(body.amount),
+      accountId: transaction.accountId,
+      toAccountId: transaction.toAccountId,
+    });
+
+    if (transaction.type === TransactionTypeEnum.EXPENSE) {
+      void checkAndNotifyBudgetThresholds(userId, transaction.category);
+    }
+
     return transaction;
   });
 };
@@ -97,17 +159,25 @@ export const getAllTransactionService = async (
     fromDate?: Date;
     toDate?: Date;
     recurringStatus?: "RECURRING" | "NON_RECURRING";
+    accountId?: string;
   },
   pagination: {
     pageSize: number;
     pageNumber: number;
   }
 ) => {
-  const { keyword, type, category, fromDate, toDate, recurringStatus } = filters;
+  const { keyword, type, category, fromDate, toDate, recurringStatus, accountId } = filters;
 
   const filterConditions: Record<string, any> = {
     userId,
   };
+
+  if (accountId) {
+    filterConditions.$and = [
+      ...(filterConditions.$and || []),
+      { $or: [{ accountId }, { toAccountId: accountId }] },
+    ];
+  }
 
   if (keyword) {
     const safeKeyword = escapeRegex(keyword);
@@ -146,6 +216,8 @@ export const getAllTransactionService = async (
 
   const [transations, totalCount] = await Promise.all([
     TransactionModel.find(filterConditions)
+      .populate("accountId", "name type accountMask color")
+      .populate("toAccountId", "name type accountMask color")
       .skip(skip)
       .limit(pageSize)
       .sort({ date: -1, createdAt: -1 }),
@@ -234,6 +306,13 @@ export const duplicateTransactionService = async (
       ledgerHash: blockHash,
     });
 
+    await duplicated.save();
+    await applyAccountBalanceDelta(userId, {
+      type: duplicated.type,
+      amount: Number(duplicated.amount),
+      accountId: duplicated.accountId,
+      toAccountId: duplicated.toAccountId,
+    });
     await recomputeUserLedgerChainUnlocked(userId);
 
     return duplicated;
@@ -252,6 +331,21 @@ export const updateTransactionService = async (
     });
     if (!existingTransaction)
       throw new NotFoundException("Transaction not found");
+
+    const oldType = existingTransaction.type;
+    const oldAmount = Number(existingTransaction.amount);
+    const oldAccountId = existingTransaction.accountId;
+    const oldToAccountId = existingTransaction.toAccountId;
+
+    const nextType = body.type ?? oldType;
+    const nextAccountId =
+      body.accountId !== undefined ? body.accountId : oldAccountId?.toString() || null;
+    const nextToAccountId =
+      body.toAccountId !== undefined
+        ? body.toAccountId
+        : oldToAccountId?.toString() || null;
+
+    await assertOwnedAccounts(userId, nextAccountId, nextToAccountId, nextType);
 
     const now = new Date();
     const isRecurring = body.isRecurring ?? existingTransaction.isRecurring;
@@ -284,6 +378,8 @@ export const updateTransactionService = async (
       }),
       ...(body.amount !== undefined && { amount: Number(body.amount) }),
       ...(body.receiptUrl !== undefined && { receiptUrl: body.receiptUrl }),
+      ...(body.accountId !== undefined && { accountId: body.accountId }),
+      ...(body.toAccountId !== undefined && { toAccountId: body.toAccountId }),
       date,
       isRecurring,
       recurringInterval,
@@ -304,6 +400,22 @@ export const updateTransactionService = async (
     });
 
     await existingTransaction.save();
+    await applyAccountBalanceDelta(
+      userId,
+      {
+        type: oldType,
+        amount: oldAmount,
+        accountId: oldAccountId,
+        toAccountId: oldToAccountId,
+      },
+      true
+    );
+    await applyAccountBalanceDelta(userId, {
+      type: existingTransaction.type,
+      amount: Number(existingTransaction.amount),
+      accountId: existingTransaction.accountId,
+      toAccountId: existingTransaction.toAccountId,
+    });
     await recomputeUserLedgerChainUnlocked(userId);
 
     return;
@@ -321,6 +433,17 @@ export const deleteTransactionService = async (
     });
     if (!deleted) throw new NotFoundException("Transaction not found");
 
+    await applyAccountBalanceDelta(
+      userId,
+      {
+        type: deleted.type,
+        amount: Number(deleted.amount),
+        accountId: deleted.accountId,
+        toAccountId: deleted.toAccountId,
+      },
+      true
+    );
+
     await recomputeUserLedgerChainUnlocked(userId);
 
     return;
@@ -332,13 +455,31 @@ export const bulkDeleteTransactionService = async (
   transactionIds: string[]
 ) => {
   return withUserLedgerLock(userId, async () => {
+    const toDelete = await TransactionModel.find({
+      _id: { $in: transactionIds },
+      userId,
+    }).select("type amount accountId toAccountId");
+
+    if (toDelete.length === 0)
+      throw new NotFoundException("No transations found");
+
     const result = await TransactionModel.deleteMany({
       _id: { $in: transactionIds },
       userId,
     });
 
-    if (result.deletedCount === 0)
-      throw new NotFoundException("No transations found");
+    for (const tx of toDelete) {
+      await applyAccountBalanceDelta(
+        userId,
+        {
+          type: tx.type,
+          amount: Number(tx.amount),
+          accountId: tx.accountId,
+          toAccountId: tx.toAccountId,
+        },
+        true
+      );
+    }
 
     await recomputeUserLedgerChainUnlocked(userId);
 
@@ -355,6 +496,9 @@ export const bulkTransactionService = async (
   transactions: CreateTransactionType[]
 ) => {
   return withUserLedgerLock(userId, async () => {
+    const defaultAccount = await resolveAccountForSmsService(userId);
+    const defaultAccountId = defaultAccount?._id?.toString() || null;
+
     const lastTx = await TransactionModel.findOne({ userId })
       .sort({ createdAt: -1, _id: -1 })
       .select("ledgerHash")
@@ -366,6 +510,8 @@ export const bulkTransactionService = async (
       const smallestAmount = convertToSmallestUnit(tx.amount);
       const txDate = tx.date ? new Date(tx.date) : new Date();
       const tempId = new mongoose.Types.ObjectId();
+      const resolvedAccountId =
+        tx.accountId !== undefined ? tx.accountId : defaultAccountId;
       const prev = runningHash;
       runningHash = computeTransactionBlockHash(prev, {
         _id: tempId,
@@ -382,6 +528,7 @@ export const bulkTransactionService = async (
             ...tx,
             _id: tempId,
             amount: smallestAmount,
+            accountId: resolvedAccountId,
             userId,
             date: txDate,
             isRecurring: false,
@@ -400,6 +547,19 @@ export const bulkTransactionService = async (
     const result = await TransactionModel.bulkWrite(bulkOps, {
       ordered: true,
     });
+
+    for (const tx of transactions) {
+      const targetAccountId =
+        tx.accountId !== undefined ? tx.accountId : defaultAccountId;
+      if (targetAccountId) {
+        await applyAccountBalanceDelta(userId, {
+          type: tx.type,
+          amount: Number(tx.amount),
+          accountId: targetAccountId,
+          toAccountId: tx.toAccountId,
+        });
+      }
+    }
 
     return {
       insertedCount: result.insertedCount,
@@ -790,9 +950,12 @@ export const exportTransactionsEmailService = async (
     if (toDate) filterConditions.date.$lte = toDate;
   }
 
-  const transactions = await TransactionModel.find(filterConditions).sort({
-    date: -1,
-  });
+  const transactions = await TransactionModel.find(filterConditions)
+    .populate("accountId", "name")
+    .populate("toAccountId", "name")
+    .sort({
+      date: -1,
+    });
 
   if (transactions.length === 0) {
     throw new BadRequestException(
@@ -807,22 +970,36 @@ export const exportTransactionsEmailService = async (
     "Category",
     `Amount (${userCurrency})`,
     "Payment Method",
+    "Account",
     "Description",
   ];
 
-  const rows = transactions.map((t) => [
-    sanitizeCsvCell(new Date(t.date).toISOString().split("T")[0]),
-    sanitizeCsvCell(t.title),
-    sanitizeCsvCell(t.type),
-    sanitizeCsvCell(
-      t.category
-        ? t.category.charAt(0).toUpperCase() + t.category.slice(1)
-        : "Other"
-    ),
-    sanitizeCsvCell(Math.abs(t.amount)),
-    sanitizeCsvCell(t.paymentMethod || "CARD"),
-    sanitizeCsvCell(t.description || ""),
-  ]);
+  const rows = transactions.map((t) => {
+    const fromAcc =
+      t.accountId && typeof t.accountId === "object"
+        ? (t.accountId as any).name
+        : "";
+    const toAcc =
+      t.toAccountId && typeof t.toAccountId === "object"
+        ? (t.toAccountId as any).name
+        : "";
+    const accLabel = fromAcc && toAcc ? `${fromAcc} -> ${toAcc}` : fromAcc || "";
+
+    return [
+      sanitizeCsvCell(new Date(t.date).toISOString().split("T")[0]),
+      sanitizeCsvCell(t.title),
+      sanitizeCsvCell(t.type),
+      sanitizeCsvCell(
+        t.category
+          ? t.category.charAt(0).toUpperCase() + t.category.slice(1)
+          : "Other"
+      ),
+      sanitizeCsvCell(Math.abs(t.amount)),
+      sanitizeCsvCell(t.paymentMethod || "CARD"),
+      sanitizeCsvCell(accLabel),
+      sanitizeCsvCell(t.description || ""),
+    ];
+  });
 
   const csvContent = [headers.join(","), ...rows.map((r) => r.join(","))].join(
     "\r\n"

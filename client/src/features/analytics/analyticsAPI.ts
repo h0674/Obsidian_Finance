@@ -112,7 +112,15 @@ export const analyticsApi = apiClient.injectEndpoints({
       }),
       invalidatesTags: (result) =>
         result?.actionTaken
-          ? ["transactions", "analytics", "reports", "budget", "telegram"]
+          ? [
+              "transactions",
+              "analytics",
+              "reports",
+              "budget",
+              "telegram",
+              "accounts",
+              "subscriptions",
+            ]
           : [],
     }),
     processVoiceCommand: builder.mutation<
@@ -131,7 +139,14 @@ export const analyticsApi = apiClient.injectEndpoints({
           action === "TRANSACTION_DELETED" ||
           action === "TRANSACTION_UPDATED"
         ) {
-          return ["transactions", "analytics", "reports", "budget"];
+          return [
+            "transactions",
+            "analytics",
+            "reports",
+            "budget",
+            "accounts",
+            "subscriptions",
+          ];
         }
         if (action === "BUDGET_UPDATED") {
           return ["budget", "analytics"];
@@ -160,6 +175,60 @@ export const analyticsApi = apiClient.injectEndpoints({
       query: () => "/analytics/liquidity-radar",
       providesTags: ["analytics", "transactions"],
     }),
+    getSubscriptionRadar: builder.query<
+      {
+        message: string;
+        data: {
+          subscriptions: Array<{
+            id: string;
+            title: string;
+            amount: number;
+            category: string;
+            interval: string;
+            nextDueDate: string;
+            daysUntilDue: number;
+            monthlyEquivalent: number;
+            source: "EXPLICIT" | "DETECTED";
+            occurrences: number;
+          }>;
+          summary: {
+            count: number;
+            totalMonthlyRecurring: number;
+            upcoming7DaysCount: number;
+            upcoming7DaysTotal: number;
+          };
+        };
+      },
+      void
+    >({
+      query: () => "/analytics/subscriptions",
+      providesTags: ["subscriptions", "transactions"],
+    }),
+    getWeeklyDigest: builder.query<
+      {
+        message: string;
+        data: {
+          userName: string;
+          currency: string;
+          thisWeekExpenses: number;
+          lastWeekExpenses: number;
+          thisWeekIncome: number;
+          deltaPercent: number;
+          topCategories: Array<{ category: string; amount: number }>;
+          upcomingRenewals: Array<{ title: string; amount: number; daysUntilDue: number }>;
+        };
+      },
+      void
+    >({
+      query: () => "/analytics/weekly-digest",
+      providesTags: ["analytics", "transactions"],
+    }),
+    sendWeeklyDigest: builder.mutation<{ message: string; sent: boolean }, void>({
+      query: () => ({
+        url: "/analytics/send-digest",
+        method: "POST",
+      }),
+    }),
   }),
 });
 
@@ -173,4 +242,7 @@ export const {
   useGetFreedomMetricsQuery,
   useSimulatePurchaseMutation,
   useGetLiquidityRadarQuery,
+  useGetSubscriptionRadarQuery,
+  useGetWeeklyDigestQuery,
+  useSendWeeklyDigestMutation,
 } = analyticsApi;
